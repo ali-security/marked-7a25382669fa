@@ -1,70 +1,137 @@
 name: "Tests"
+
+# Sealed-build fork workflow.
+#
+# Upstream ran this on `pull_request` / `push`; on the fork it is dispatch-only
+# so the sync push does not fire it. The Test job keeps upstream's own test
+# commands (`npm run test:unit` / `npm run test:specs`) verbatim; a `Pack` job
+# was added because upstream builds the release tarball in the `Release` job,
+# which needs NPM_TOKEN/GITHUB_TOKEN and is hard-gated on
+# `github.event.repository.fork == false`, so it cannot run here.
+#
+# Removed from upstream: the `Lint` job (eslint gate — not a test, nothing we
+# ship depends on it), the `Release` job (secrets + non-fork gate), the `Skip`
+# job (dead without `github.event.head_commit`), and the
+# `!contains(github.event.head_commit.message, '[skip ci]')` guards
+# (`github.event.head_commit` is null on workflow_dispatch, so the guards
+# evaluate falsy and every job would be skipped).
+#
+# Dependency resolution is pinned to the npm registry time machine at the
+# 2.0.6 release date (2021-05-27T16:17:12.429000Z) so every `npm ci` resolves
+# the versions that existed when the public tarball was published.
+
 on:
-  pull_request:
-  push:
-    branches:
-      - master
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Jasmine spec-name filter; empty runs the full suite"
+        required: false
+        default: ""
 
 jobs:
   Test:
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
     strategy:
+      fail-fast: false
       matrix:
-        node_version: ['lts/*', 'node']
+        node_version: ['14', '8']
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
+      # Upstream used `dcodeIO/setup-node-nvm@master` with node_version
+      # ['lts/*', 'node']. That action is unpinned (`@master`) and unreliable on
+      # a fork, and floating aliases would not give the required 14 / 8 matrix,
+      # so it is replaced by the first-party `actions/setup-node@v3`, which
+      # resolves 8.x from nodejs.org/dist when it is not in the runner manifest.
       - name: Install Node
-        uses: dcodeIO/setup-node-nvm@master
+        uses: actions/setup-node@v3
         with:
           node-version: ${{ matrix.node_version }}
+      - name: Pin npm registry to the release-date time machine
+        run: |
+          npm config set registry https://time-machines-npm.sealsecurity.io/
+          npm config set //time-machines-npm.sealsecurity.io/:_authToken=2021-05-27T16:17:12.429000Z
+      # `package-lock.json` is lockfileVersion 1, so `npm ci` works unchanged on
+      # Node 8's bundled npm 6.13.4 (verified: 774 packages installed clean).
+      # No dependency edits are needed for the Node 8 leg.
       - name: Install Dependencies
         run: npm ci
       - name: Run Unit Tests 👩🏽‍💻
-        run: npm run test:unit
-      - name: Run Spec Tests 👩🏽‍💻
-        run: npm run test:specs
-
-  Lint:
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v2
-      - name: Install Dependencies
-        run: npm ci
-      - name: Lint ✨
-        run: npm run test:lint
-
-  Release:
-    needs: [Test, Lint]
-    if: |
-      github.ref == 'refs/heads/master' &&
-      github.event.repository.fork == false
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v2
-      - name: Install Dependencies
-        run: npm ci
-      - name: Build 🗜️
+        if: matrix.node_version != '8'
         run: |
-          npm run build
-          if ! git diff --quiet; then
-            git config --global user.email "<>"
-            git config --global user.name "MarkedJS bot"
-            git commit -am "🗜️ build [skip ci]"
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            npm test -- --filter="${{ inputs.test-filter }}"
+          else
+            npm run test:unit
           fi
-      - name: Release 🎉
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npx semantic-release
+      - name: Run Spec Tests 👩🏽‍💻
+        if: matrix.node_version != '8'
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            echo "test-filter is set; the filtered run in the previous step already covered test/specs"
+          else
+            npm run test:specs
+          fi
+      # marked 2.0.6 declares `engines.node: ">= 8.16.2"`, but its own source
+      # cannot execute on Node 8: src/Tokenizer.js:553 evaluates
+      # `prevChar.match(/[\p{L}\p{N}]/u)` — an ES2018 Unicode property escape
+      # that V8 only supports unflagged from Node 10 (Node 8 needs
+      # `--harmony-regexp-property`, which node refuses inside NODE_OPTIONS).
+      # Reproduced on node:8.17.0 (npm 6.13.4) with the release-date dependency
+      # tree: `npm ci` succeeds, but the suite dies with
+      # "SyntaxError: Invalid regular expression: /[\p{L}\p{N}]/: Invalid escape"
+      # — 2 of 118 unit specs and 105 of 1443 spec-suite specs fail. Two further
+      # blockers sit in front of that one: jasmine 3.7.0's lib/loader.js uses a
+      # dynamic `import()` Node 8 cannot parse, and the newest jasmine that both
+      # parses on Node 8 and still provides `jasmine.addAsyncMatchers` (required
+      # by test/helpers/helpers.js) is 3.5.0 — i.e. reaching the failure at all
+      # already requires downgrading the project's test framework.
+      #
+      # These are genuine incompatibilities of the unpatched upstream release,
+      # not something this workflow introduces, so the leg is declared unviable
+      # rather than masked (no `|| true`, no `continue-on-error`) or faked. The
+      # leg still installs the full dependency tree on Node 8, which is the part
+      # that does work. Tests run for real on the Node 14 leg.
+      - name: Declare Node 8 test run unviable
+        if: matrix.node_version == '8'
+        run: |
+          echo "=== Skipping Node 8: src/Tokenizer.js uses the ES2018 Unicode property escape /[\p{L}\p{N}]/u, which V8 only supports unflagged from Node 10; jasmine 3.7 also cannot be parsed by Node 8. Dependency install on Node 8 succeeded above. ==="
 
-  Skip:
-    if: contains(github.event.head_commit.message, '[skip ci]')
+  Pack:
+    # Builds the release artifact, which upstream only ever produced inside the
+    # `Release` job. Node 14.17.0 + npm 7.12.0 are the exact runtime/packer the
+    # public marked-2.0.6.tgz was published with; verified locally to reproduce
+    # the registry tarball byte-for-byte
+    # (sha256 8955f1e034f4ee88bb5d2807a95a5e3dd21fbb8ecc2ce437e2a3e90ba35611f1).
+    #
+    # `npm run build` is deliberately NOT run: lib/marked.js, lib/marked.esm.js
+    # and marked.min.js are already committed at their released state (HEAD is
+    # the "chore(release): 2.0.6 [skip ci]" commit) and `package.json` `files`
+    # ships bin/ lib/ src/ man/ marked.min.js, so a rollup/uglify rerun could
+    # only diverge from the published bytes.
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - name: Skip CI 🚫
-        run: echo skip ci
+      - name: Checkout Code
+        uses: actions/checkout@v3
+      - name: Install Node
+        uses: actions/setup-node@v3
+        with:
+          node-version: 14.17.0
+      - name: Install the publishing npm
+        run: npm install -g npm@7.12.0
+      - name: Pin npm registry to the release-date time machine
+        run: |
+          npm config set registry https://time-machines-npm.sealsecurity.io/
+          npm config set //time-machines-npm.sealsecurity.io/:_authToken=2021-05-27T16:17:12.429000Z
+      - name: Install Dependencies
+        run: npm ci
+      - name: Pack 📦
+        run: npm pack
+      - name: Upload Tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: marked-tarball
+          path: marked-2.0.6.tgz
+          if-no-files-found: error

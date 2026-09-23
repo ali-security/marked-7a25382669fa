@@ -5,14 +5,12 @@
 # or to provide custom queries or build logic.
 name: "CodeQL"
 
+# Neutralized for the sealed-build fork: upstream fired this on push /
+# pull_request / schedule, which would burn CI on every fork sync. CodeQL is a
+# static-analysis gate, not a build or test, so it is dispatch-only here and is
+# never dispatched. The analysis steps below are untouched.
 on:
-  push:
-    branches: [master]
-  pull_request:
-    # The branches below must be a subset of the branches above
-    branches: [master]
-  schedule:
-    - cron: '0 9 * * 3'
+  workflow_dispatch:
 
 jobs:
   analyze:
